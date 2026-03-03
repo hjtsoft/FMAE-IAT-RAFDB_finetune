@@ -78,7 +78,7 @@ class TextGuidedSoftLabelLoss(torch.nn.Module):
         
         # 4. 加权融合返回
         return (1 - self.alpha) * hard_loss + self.alpha * soft_loss
-        
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
@@ -120,6 +120,21 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=False,
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
+        # =======================================================
+        # 探针：监控 TextGuided 模块的梯度健康度 (仅在第一个 Batch 打印)
+        # =======================================================
+        if epoch == 0 and data_iter_step == 0:
+            if hasattr(model, 'module'): # 处理 DDP 封装
+                attn_module = model.module.text_attn
+            else:
+                attn_module = model.text_attn
+            
+            q_proj_grad = attn_module.q_proj.weight.grad
+            gamma_val = attn_module.gamma.data.item()
+            if q_proj_grad is not None:
+                print(f"\n[梯度探针] Gamma 初始值: {gamma_val:.4f}")
+                print(f"[梯度探针] q_proj.weight 梯度绝对值均值: {q_proj_grad.abs().mean().item():.2e}")
+        # =======================================================
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
         torch.cuda.synchronize()

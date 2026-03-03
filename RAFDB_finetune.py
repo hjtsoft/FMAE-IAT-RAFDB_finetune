@@ -236,7 +236,7 @@ def main(args):
         #     assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
         # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
+        trunc_normal_(model.AU_head.weight, std=2e-5)
 
     model.to(device)
     model_without_ddp = model
@@ -258,29 +258,59 @@ def main(args):
         model_without_ddp = model.module
 
     # optimizer with layer-wise lr decay (lrd)
-    param_groups = lrd.param_groups_lrd(
-        model_without_ddp, args.weight_decay,
-        no_weight_decay_list=model_without_ddp.no_weight_decay(),
+    # 1. 先获取官方的逐层衰减 parameter groups
+    param_groups = lrd.param_groups_lrd(model, args.weight_decay,
+        no_weight_decay_list=model.no_weight_decay(),
         layer_decay=args.layer_decay
     )
+    
+    # =======================================================
+    # 新增：安全剥离 text_attn 参数，并赋予 50 倍暴走学习率！
+    # 完美兼容 DDP 包装与 MAE Scheduler 逻辑
+    # =======================================================
+    # 兼容 DDP 获取模块
+    attn_module = model.module.text_attn if hasattr(model, 'module') else model.text_attn
+    
+    text_attn_params = []
+    text_attn_ids = {id(p) for p in attn_module.parameters()}
+    
+    # 从原有的 groups 中剔除 text_attn 的参数
+    for group in param_groups:
+        new_params = []
+        for p in group['params']:
+            if id(p) in text_attn_ids:
+                text_attn_params.append(p)
+            else:
+                new_params.append(p)
+        group['params'] = new_params
+        
+    # 为 text_attn 单独创建一个高优先级的 group
+    if len(text_attn_params) > 0:
+        param_groups.append({
+            'params': text_attn_params,
+            'weight_decay': args.weight_decay,
+            'lr_scale': 50.0,          # 仅保留 lr_scale，交由 lr_sched 统一调度
+            'name': 'text_attn_boost'
+        })
+    # =======================================================
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+
+    # =======================================================
+    # 探针 1：验证独立优化器分组是否生效
+    # =======================================================
+    for g in optimizer.param_groups:
+        if g.get('name') == 'text_attn_boost':
+            print(f"\n[优化器探针] 🚀 成功激活特供通道! lr_scale: {g.get('lr_scale')}, 包含参数张量数: {len(g['params'])}\n")
     loss_scaler = NativeScaler()
 
     # loss function
-    from engine_finetune import TextGuidedSoftLabelLoss
-    
     if mixup_fn is not None:
-        criterion = SoftTargetCrossEntropy()  # 开启 Mixup 时暂退回默认 Loss
+        criterion = SoftTargetCrossEntropy()  
+    elif args.smoothing > 0.:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        # 核心替换：使用 Llama-3 文本特征引导的软标签 Loss
-        text_feat_path = '/Data/hjt/affectnet_7class_au_text_features.pt'
-        criterion = TextGuidedSoftLabelLoss(
-            text_features_path=text_feat_path, 
-            alpha=0.3,   # LLM 软标签在总 Loss 中的占比（可调参，推荐在 0.2~0.5 之间）
-            tau=0.05,    # 软分布温度
-            smoothing=args.smoothing
-        )
-    criterion.to(device)
+        criterion = torch.nn.CrossEntropyLoss()
     print("criterion = %s" % str(criterion))
 
     # resume training if args.resume
@@ -302,7 +332,15 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-
+        # =======================================================
+        # 探针 2：Gamma 生命体征监控
+        # =======================================================
+        if hasattr(model, 'module'):
+            raw = model.module.text_attn.gamma.item()
+        else:
+            raw = model.text_attn.gamma.item()
+        effective = torch.sigmoid(torch.tensor(raw)).item()
+        print(f"\n👀 [Epoch {epoch} 总结] Text-Guided Gamma 门控值: {effective:.6f} (raw: {raw:.4f})\n")
         # save ckpt
         if args.save_ckpt:
             misc.save_model(
@@ -314,9 +352,17 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device)
 
         print(f"Accuracy at epoch {epoch}: {test_stats['acc1']:.1f}%")
+        # --- 只要是 Max 就存 ---
         if test_stats["acc1"] > max_accuracy:
             max_accuracy = test_stats["acc1"]
             max_acc_epoch = epoch
+            if args.output_dir:
+                # 显式保存为 checkpoint-best.pth
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, 
+                    optimizer=optimizer, loss_scaler=loss_scaler, epoch='best'
+                )
+                print(f'*** New best model saved! Accuracy: {max_accuracy:.2f}% ***')
         print(f'Max accuracy: {max_accuracy:.2f}% at epoch {max_acc_epoch}')
 
         # if log_writer is not None:
