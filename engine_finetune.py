@@ -24,7 +24,61 @@ from timm.utils import accuracy
 import util.misc as misc
 import util.lr_sched as lr_sched
 
+import torch.nn.functional as F
+from timm.loss import LabelSmoothingCrossEntropy
 
+class TextGuidedSoftLabelLoss(torch.nn.Module):
+    def __init__(self, text_features_path, alpha=0.3, tau=0.5, smoothing=0.15):
+        """
+        alpha: 控制 Llama-3 软标签 Loss 的权重比 (0~1)
+        tau: 温度系数，值越大分布越平滑。默认设为 0.5，保留类别间合理差异。
+        """
+        super().__init__()
+        self.alpha = alpha
+        
+        # 1. 加载 Llama-3 提取的文本特征
+        text_features = torch.load(text_features_path, map_location='cpu', weights_only=False)
+        if isinstance(text_features, dict):
+            text_features = text_features.get('features', text_features)
+            
+        # =========================================================================
+        # [修复问题 1: 对齐 AffectNet 与 RAF-DB 的类别顺序]
+        # 假设你当初提取 AffectNet 文本特征时的顺序是标准的：
+        #   [0: Neutral, 1: Happy, 2: Sad, 3: Surprise, 4: Fear, 5: Disgust, 6: Anger]
+        # 而 RAF-DB 训练时(经过 -1 处理后)的顺序是：
+        #   [0: Surprise, 1: Fear, 2: Disgust, 3: Happiness, 4: Sadness, 5: Anger, 6: Neutral]
+        # 
+        # 下面列表的意思是：取 AffectNet 的第 3 号、第 4 号... 重新组合成 RAF-DB 的顺序。
+        # ⚠️ 请务必回忆/检查你保存 .pt 时用的文本列表顺序，如果不同，请修改此 mapping！
+        # =========================================================================
+        affectnet_to_rafdb_idx = [3, 4, 5, 1, 2, 6, 0] 
+        text_features = text_features[affectnet_to_rafdb_idx]
+        
+        # 2. L2 归一化并计算类别间的余弦相似度矩阵
+        text_features = F.normalize(text_features.float(), p=2, dim=-1)
+        sim_matrix = text_features @ text_features.T
+        
+        # 3. [修复问题 2 & 3: 增大 tau 到 0.5，并注册为 buffer 以规范化计算图和设备挂载]
+        soft_labels = F.softmax(sim_matrix / tau, dim=1)
+        self.register_buffer('text_soft_labels', soft_labels)
+        
+        # 保留原有的平滑策略作为基础 Loss
+        self.hard_criterion = LabelSmoothingCrossEntropy(smoothing=smoothing)
+
+    def forward(self, outputs, targets):
+        # 1. 计算原始的 Hard/Smoothing Loss
+        hard_loss = self.hard_criterion(outputs, targets)
+        
+        # 2. 从 buffer 中找到 Batch 对应的 Llama-3 软标签 [B, 7] (自动与 outputs 同设备)
+        batch_soft_targets = self.text_soft_labels[targets]
+        
+        # 3. 计算预测分布与 LLM 软标签的交叉熵 (软蒸馏)
+        log_probs = F.log_softmax(outputs, dim=1)
+        soft_loss = -(batch_soft_targets * log_probs).sum(dim=1).mean()
+        
+        # 4. 加权融合返回
+        return (1 - self.alpha) * hard_loss + self.alpha * soft_loss
+        
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,

@@ -267,12 +267,20 @@ def main(args):
     loss_scaler = NativeScaler()
 
     # loss function
+    from engine_finetune import TextGuidedSoftLabelLoss
+    
     if mixup_fn is not None:
-        criterion = SoftTargetCrossEntropy()  # smoothing is handled with mixup label transform
-    elif args.smoothing > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        criterion = SoftTargetCrossEntropy()  # 开启 Mixup 时暂退回默认 Loss
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        # 核心替换：使用 Llama-3 文本特征引导的软标签 Loss
+        text_feat_path = '/Data/hjt/affectnet_7class_au_text_features.pt'
+        criterion = TextGuidedSoftLabelLoss(
+            text_features_path=text_feat_path, 
+            alpha=0.3,   # LLM 软标签在总 Loss 中的占比（可调参，推荐在 0.2~0.5 之间）
+            tau=0.05,    # 软分布温度
+            smoothing=args.smoothing
+        )
+    criterion.to(device)
     print("criterion = %s" % str(criterion))
 
     # resume training if args.resume
