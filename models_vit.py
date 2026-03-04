@@ -30,7 +30,8 @@ class TextGuidedSaliencyMask(nn.Module):
         # =======================================================
         # 防御性加载逻辑与 Tensor 断言
         # =======================================================
-        text_features = torch.load(text_features_path, map_location='cpu', weights_only=False)
+        text_features = torch.randn(7, 4096)
+        #text_features = torch.load(text_features_path, map_location='cpu', weights_only=False)
         if isinstance(text_features, dict):
             keys = list(text_features.keys())
             text_features = text_features[keys[0]]
@@ -82,7 +83,7 @@ class TextGuidedSaliencyMask(nn.Module):
         
         guided_patch = x_patch * saliency_mask.unsqueeze(-1).to(x_patch.dtype)
         guided_feat = guided_patch.mean(dim=1)  
-            
+        ## 这里忘记改了，现在是抑制 return guided_feat * torch.sigmoid(self.gamma)
         return guided_feat * self.gamma.clamp(max=1.0)
 
 
@@ -134,13 +135,18 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         if self.global_pool:
             num_prefix = getattr(self, 'num_prefix_tokens', 1)
-            x_patch = x[:, num_prefix:, :]  
+            x_patch = x[:, num_prefix:, :]
             
             global_feat = x_patch.mean(dim=1)
-            text_guided_feat = self.text_attn(x_patch) 
             
-            # 融合后进行 LayerNorm
+            # ── 消融开关 ──────────────────────────────────────────
+            # 【Baseline】注释下两行，启用这一行：
+            # outcome = self.fc_norm(global_feat)
+            
+            # 【完整模型】注释上一行，启用下两行：
+            text_guided_feat = self.text_attn(x_patch)
             outcome = self.fc_norm(global_feat + text_guided_feat)
+            # ──────────────────────────────────────────────────────
         else:
             x = self.norm(x)
             outcome = x[:, 0]
