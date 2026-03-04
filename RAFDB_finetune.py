@@ -146,7 +146,7 @@ def main(args):
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    # dataset and data_loder
+    # dataset and data_loader
     dataset_train = build_RAFDB_dataset(args.train_path, is_train=True, args=args)
     dataset_val = build_RAFDB_dataset(args.test_path, is_train=False, args=args)
 
@@ -203,7 +203,7 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
-    # model
+    # model（文本相关参数已全部移除）
     model = models_vit.__dict__[args.model](
         num_classes=args.nb_classes,
         num_subjects=args.nb_subjects,
@@ -228,12 +228,7 @@ def main(args):
 
         # load pre-trained model
         msg = model.load_state_dict(checkpoint_model, strict=False)
-        print(f"compatibility info: {msg}" )
-
-        # if args.global_pool:
-        #     assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-        # else:
-        #     assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
+        print(f"compatibility info: {msg}")
 
         # manually initialize fc layer
         trunc_normal_(model.AU_head.weight, std=2e-5)
@@ -241,7 +236,6 @@ def main(args):
     model.to(device)
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # print("Model = %s" % str(model_without_ddp))
     print('number of params (M): %.2f' % (n_parameters / 1.e6))
 
     # learning rate
@@ -258,55 +252,19 @@ def main(args):
         model_without_ddp = model.module
 
     # optimizer with layer-wise lr decay (lrd)
-    # 1. 先获取官方的逐层衰减 parameter groups
+    # SpatialSaliencyAttention 参数量极少（66K），梯度链路短，
+    # 使用统一的 layer decay 即可，无需单独 param group
     param_groups = lrd.param_groups_lrd(model, args.weight_decay,
         no_weight_decay_list=model.no_weight_decay(),
         layer_decay=args.layer_decay
     )
-    
-    # =======================================================
-    # 新增：安全剥离 text_attn 参数，并赋予 50 倍暴走学习率！
-    # 完美兼容 DDP 包装与 MAE Scheduler 逻辑
-    # =======================================================
-    # 兼容 DDP 获取模块
-    attn_module = model.module.text_attn if hasattr(model, 'module') else model.text_attn
-    
-    text_attn_params = []
-    text_attn_ids = {id(p) for p in attn_module.parameters()}
-    
-    # 从原有的 groups 中剔除 text_attn 的参数
-    for group in param_groups:
-        new_params = []
-        for p in group['params']:
-            if id(p) in text_attn_ids:
-                text_attn_params.append(p)
-            else:
-                new_params.append(p)
-        group['params'] = new_params
-        
-    # 为 text_attn 单独创建一个高优先级的 group
-    if len(text_attn_params) > 0:
-        param_groups.append({
-            'params': text_attn_params,
-            'weight_decay': args.weight_decay,
-            'lr_scale': 50.0,          # 仅保留 lr_scale，交由 lr_sched 统一调度
-            'name': 'text_attn_boost'
-        })
-    # =======================================================
-
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
 
-    # =======================================================
-    # 探针 1：验证独立优化器分组是否生效
-    # =======================================================
-    for g in optimizer.param_groups:
-        if g.get('name') == 'text_attn_boost':
-            print(f"\n[优化器探针] 🚀 成功激活特供通道! lr_scale: {g.get('lr_scale')}, 包含参数张量数: {len(g['params'])}\n")
     loss_scaler = NativeScaler()
 
     # loss function
     if mixup_fn is not None:
-        criterion = SoftTargetCrossEntropy()  
+        criterion = SoftTargetCrossEntropy()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
@@ -320,6 +278,7 @@ def main(args):
     start_time = time.time()
     max_accuracy = 0.0
     max_acc_epoch = 0
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -332,15 +291,15 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
+
         # =======================================================
-        # 探针 2：Gamma 生命体征监控
+        # 探针：Gamma 门控值监控
         # =======================================================
-        if hasattr(model, 'module'):
-            raw = model.module.text_attn.gamma.item()
-        else:
-            raw = model.text_attn.gamma.item()
-        effective = torch.sigmoid(torch.tensor(raw)).item()
-        print(f"\n👀 [Epoch {epoch} 总结] Text-Guided Gamma 门控值: {effective:.6f} (raw: {raw:.4f})\n")
+        attn_module = model.module.spatial_attn if hasattr(model, 'module') else model.spatial_attn
+        gamma_val = attn_module.gamma.item()
+        print(f"\n👀 [Epoch {epoch} 总结] Spatial Saliency Gamma: {gamma_val:.6f}\n")
+        # =======================================================
+
         # save ckpt
         if args.save_ckpt:
             misc.save_model(
@@ -350,36 +309,19 @@ def main(args):
 
         # evaluation
         test_stats = evaluate(data_loader_val, model, device)
-
         print(f"Accuracy at epoch {epoch}: {test_stats['acc1']:.1f}%")
-        # --- 只要是 Max 就存 ---
+
+        # 只要是 Max 就存
         if test_stats["acc1"] > max_accuracy:
             max_accuracy = test_stats["acc1"]
             max_acc_epoch = epoch
             if args.output_dir:
-                # 显式保存为 checkpoint-best.pth
                 misc.save_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, 
+                    args=args, model=model, model_without_ddp=model_without_ddp,
                     optimizer=optimizer, loss_scaler=loss_scaler, epoch='best'
                 )
                 print(f'*** New best model saved! Accuracy: {max_accuracy:.2f}% ***')
         print(f'Max accuracy: {max_accuracy:.2f}% at epoch {max_acc_epoch}')
-
-        # if log_writer is not None:
-        #     log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-        #     log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
-        #     log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
-        #
-        # log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-        #                 **{f'test_{k}': v for k, v in test_stats.items()},
-        #                 'epoch': epoch,
-        #                 'n_parameters': n_parameters}
-        #
-        # if args.output_dir and misc.is_main_process():
-        #     if log_writer is not None:
-        #         log_writer.flush()
-        #     with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-        #         f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
