@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+# 在某些环境中脚本可能被 sh 间接执行，pipefail 不是所有 shell 都支持
+if (set -o pipefail) 2>/dev/null; then
+  set -o pipefail
+fi
 
 # 一键跑 RAF-DB 消融：
 # A0: 无先验掩码
