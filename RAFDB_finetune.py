@@ -125,6 +125,8 @@ def get_args_parser():
     parser.add_argument('--save_ckpt', action='store_true', help='whether save ckpt at each training epoch.')
     parser.set_defaults(save_ckpt=False)
     parser.add_argument('--prior_mask_dir', default='/Data/hjt/NLA/datasets/RAF-DB/basic/Annotation/au_prior', type=str,help='AU 先验掩码目录（None 时不使用先验）')
+    parser.add_argument('--text_attn_lr_scale', default=50.0, type=float,
+                        help='text_attn 参数组的学习率缩放系数')
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
@@ -289,7 +291,7 @@ def main(args):
         param_groups.append({
             'params': text_attn_params,
             'weight_decay': args.weight_decay,
-            'lr_scale': 50.0,          # 仅保留 lr_scale，交由 lr_sched 统一调度
+            'lr_scale': args.text_attn_lr_scale,          # 仅保留 lr_scale，交由 lr_sched 统一调度
             'name': 'text_attn_boost'
         })
     # =======================================================
