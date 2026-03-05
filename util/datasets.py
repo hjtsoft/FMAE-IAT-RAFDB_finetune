@@ -64,7 +64,7 @@ def build_transform(is_train, args):
         crop_pct = 1.0
     size = int(args.input_size / crop_pct)
     t.append(
-        transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),  # to maintain same ratio w.r.t. 224 images
+        transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
     )
     t.append(transforms.CenterCrop(args.input_size))
 
@@ -108,37 +108,48 @@ def BP4D_plus_AU_dataset(json_path, is_train, args):
     dataset = BP4D_plus_dataset(args.root_path, json_path, transform=transform)
     return dataset
 
+
 # --- 新增 Custom Dataset 类用于 RAF-DB ---
 class CustomRAFDBDataset(Dataset):
-    def __init__(self, root_dir, list_file, transform=None, is_train=True):
+    def __init__(self, root_dir, list_file, transform=None, is_train=True,
+                 prior_mask_path=None):
         self.root_dir = root_dir
         self.transform = transform
         self.image_paths = []
         self.labels = []
-        
+        self.stems = []  # 用于索引先验掩码，如 'train_00001'
+
         with open(list_file, 'r') as f:
             lines = f.readlines()
             for line in lines:
                 line = line.strip()
                 if not line: continue
-                # 文件名和标签以空格分隔
                 img_name, label = line.split(' ')
-                
-                # 根据训练/验证模式过滤数据
+
                 if is_train and img_name.startswith('test'): continue
                 if not is_train and img_name.startswith('train'): continue
-                
-                # 尝试匹配 aligned 图片路径
+
                 name_part, ext = os.path.splitext(img_name)
                 aligned_name = name_part + "_aligned" + ext
                 img_path = os.path.join(root_dir, aligned_name)
-                
+
                 if not os.path.exists(img_path):
                     img_path = os.path.join(root_dir, img_name)
-                    
+
                 self.image_paths.append(img_path)
-                # RAF-DB 原生标签是 1-7，PyTorch 交叉熵需要 0-6
-                self.labels.append(int(label) - 1) 
+                self.labels.append(int(label) - 1)
+                # stem: 'train_00001.jpg' → 'train_00001'
+                self.stems.append(os.path.splitext(img_name)[0])
+
+        # ── 加载先验掩码字典（可选）──────────────────────────────────────────
+        # prior_mask_dict: { 'train_00001': np.array([14,14]), ... }
+        if prior_mask_path and os.path.exists(prior_mask_path):
+            self.prior_mask_dict = np.load(prior_mask_path, allow_pickle=True).item()
+            print(f"  已加载先验掩码: {prior_mask_path}（共 {len(self.prior_mask_dict)} 条）")
+        else:
+            self.prior_mask_dict = None
+            if prior_mask_path:
+                print(f"  警告：先验掩码文件不存在 {prior_mask_path}，退化为全1掩码")
 
     def __len__(self):
         return len(self.image_paths)
@@ -147,19 +158,47 @@ class CustomRAFDBDataset(Dataset):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
+
         if self.transform:
             image = self.transform(image)
-        return image, label
+
+        # ── 获取先验掩码 ──────────────────────────────────────────────────────
+        if self.prior_mask_dict is not None:
+            stem = self.stems[idx]
+            mask = self.prior_mask_dict.get(stem, None)
+            if mask is None:
+                # 字典里找不到（理论上不会发生，fix_prior_masks.py 已处理）
+                mask = np.ones((14, 14), dtype=np.float32)
+            # reshape 成 [196, 1] 方便直接送入模型
+            prior_mask = torch.from_numpy(mask).float().reshape(196, 1)
+        else:
+            prior_mask = torch.ones(196, 1)
+
+        return image, label, prior_mask
+
 
 # --- 替换原有的 build_RAFDB_dataset ---
 def build_RAFDB_dataset(folder_path, is_train, args):
-    # 使用服务器上的绝对路径
-    img_dir = '/Data/hjt/NLA/datasets/RAF-DB/basic/Image/aligned'
+    img_dir  = '/Data/hjt/NLA/datasets/RAF-DB/basic/Image/aligned'
     txt_file = '/Data/hjt/NLA/datasets/RAF-DB/basic/EmoLabel/list_patition_label.txt'
-    
+
+    # 先验掩码路径（从 args 读取，不传时退化为全1掩码）
+    prior_dir = getattr(args, 'prior_mask_dir', None)
+    if prior_dir:
+        mask_file = os.path.join(prior_dir,
+                                 'au_prior_train.npy' if is_train else 'au_prior_test.npy')
+    else:
+        mask_file = None
+
     transform = build_AU_transform(is_train, args)
-    dataset = CustomRAFDBDataset(root_dir=img_dir, list_file=txt_file, transform=transform, is_train=is_train)
-    
+    dataset = CustomRAFDBDataset(
+        root_dir=img_dir,
+        list_file=txt_file,
+        transform=transform,
+        is_train=is_train,
+        prior_mask_path=mask_file,
+    )
+
     print(f"=> Loaded RAF-DB Custom Dataset: {len(dataset)} images (is_train={is_train})")
     return dataset
 
@@ -168,7 +207,6 @@ def build_AU_transform(is_train, args):
     mean = IMAGENET_DEFAULT_MEAN
     std = IMAGENET_DEFAULT_STD
 
-    # train transform
     if is_train:
         transform = create_transform(
             input_size=args.input_size,
@@ -183,7 +221,6 @@ def build_AU_transform(is_train, args):
             std=std,
         )
         return transform
-    # eval transform
     else:
         return transforms.Compose(
             [transforms.Resize([args.input_size, args.input_size]),
@@ -191,11 +228,8 @@ def build_AU_transform(is_train, args):
              transforms.Normalize(mean, std)]
         )
 
+
 class BP4D_dataset(Dataset):
-    """
-    accept the json file to construct the dataset.
-    Each line of the json file contains the image path and the AU labels.
-    """
     def __init__(self, root_path, json_file, transform=None):
         self.data = self._load_data(json_file)
         print(f"building dataset from: {json_file}")
@@ -226,12 +260,11 @@ class BP4D_dataset(Dataset):
         image_path = self.root_path + self.data[idx]['img_path']
         image = Image.open(image_path).convert('RGB')
 
-        # Convert label indices to binary representation
-        AUs = self.data[idx]['AUs']  # e.g. [4, 10, 14]
+        AUs = self.data[idx]['AUs']
         ID = self.data[idx]['img_path'][0:4]
 
-        AU_labels = torch.zeros(len(self.AUs))  # 12 classes
-        ID_labels = torch.zeros(len(self.IDs))  # 41 classes
+        AU_labels = torch.zeros(len(self.AUs))
+        ID_labels = torch.zeros(len(self.IDs))
 
         for au in AUs:
             AU_labels[self.AU_label2idx[au]] = 1
@@ -245,10 +278,6 @@ class BP4D_dataset(Dataset):
 
 
 class BP4D_plus_dataset(Dataset):
-    """
-    accept the json file to construct the dataset.
-    Each line of the json file contains the image path and the AU labels.
-    """
     def __init__(self, root_path, json_file, transform=None):
         self.data = self._load_data(json_file)
         print(f"building dataset from: {json_file}")
@@ -286,12 +315,11 @@ class BP4D_plus_dataset(Dataset):
         image_path = self.root_path + self.data[idx]['img_path']
         image = Image.open(image_path).convert('RGB')
 
-        # Convert label indices to binary representation
-        AUs = self.data[idx]['AUs']  # e.g. [4, 10, 14]
+        AUs = self.data[idx]['AUs']
         ID = self.data[idx]['img_path'][0:4]
 
-        AU_labels = torch.zeros(len(self.AUs))  # 12 classes
-        ID_labels = torch.zeros(len(self.IDs))  # 140 classes
+        AU_labels = torch.zeros(len(self.AUs))
+        ID_labels = torch.zeros(len(self.IDs))
 
         for au in AUs:
             AU_labels[self.AU_label2idx[au]] = 1

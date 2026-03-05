@@ -18,18 +18,10 @@ class TextGuidedSaliencyMask(nn.Module):
                  mapping_idx=(3, 4, 5, 1, 2, 6, 0)):
         super().__init__()
         
-        # 稳住输入范数
         self.input_norm = nn.LayerNorm(dim_v)
-        
-        # 视觉侧降维投影
         self.q_proj = nn.Linear(dim_v, dim_inner)
-        
-        # 缩放因子：1 / sqrt(128) ≈ 0.088
         self.scale = dim_inner ** -0.5
         
-        # =======================================================
-        # 防御性加载逻辑与 Tensor 断言
-        # =======================================================
         text_features = torch.load(text_features_path, map_location='cpu', weights_only=False)
         if isinstance(text_features, dict):
             keys = list(text_features.keys())
@@ -41,48 +33,42 @@ class TextGuidedSaliencyMask(nn.Module):
         text_features = text_features[list(mapping_idx)]
         text_features = text_features.float()
         
-        # =======================================================
-        # 文本侧神来之笔：DDP 安全的静态正交降维 (4096 -> 128)
-        # 固定随机种子，防止多卡训练时各进程目标坐标系不一致导致梯度对冲
-        # =======================================================
         with torch.no_grad():
             generator = torch.Generator()
-            generator.manual_seed(42)  # 固定种子保证所有 GPU 生成同一套坐标系
-            
-            # 利用 QR 分解提取天然正交矩阵 (Q 矩阵)
+            generator.manual_seed(42)
             random_matrix = torch.randn(dim_t, dim_inner, generator=generator)
             random_proj = torch.linalg.qr(random_matrix)[0]
-            
-            # 将文本特征降维并确立标准的 128 维方向系
             text_keys_128 = text_features @ random_proj
             text_keys_128 = F.normalize(text_keys_128, p=2, dim=-1)
             
         self.register_buffer('text_keys', text_keys_128)  # [7, 128]
-        
-        # 0.1 初始动量
-        # sigmoid(-2.197) ≈ 0.1，保持初始权重与之前一致
         self.gamma = nn.Parameter(torch.ones(1) * -2.197)
 
-    def forward(self, x_patch):
-        # AMP 豁免区：强制在 FP32 下运行
+    def forward(self, x_patch, prior_mask=None):
+        """
+        x_patch    : [B, 196, 1024]
+        prior_mask : [B, 196, 1]，AU 几何先验掩码（可选，None 时退化为原始行为）
+        """
         device_type = x_patch.device.type if x_patch.device.type in ['cuda', 'cpu'] else 'cuda'
         with torch.autocast(device_type=device_type, enabled=False):
             x_fp32 = x_patch.float()
             x_normed = self.input_norm(x_fp32)
-            
-            # Q 的维度现在是 [B, 196, 128]
-            q = self.q_proj(x_normed)  
-            
-            # Scaled Dot-Product Attention
+            q = self.q_proj(x_normed)              # [B, 196, 128]
             attn_scores = (q @ self.text_keys.T) * self.scale  # [B, 196, 7]
-            
-        # 后续操作对精度不敏感
+
         max_scores, _ = torch.max(attn_scores, dim=-1)
-        saliency_mask = torch.sigmoid(max_scores)
-        
+        saliency_mask = torch.sigmoid(max_scores)  # [B, 196]
+
+        # ── AU 先验约束：学习掩码 × 几何先验掩码 ────────────────────────────
+        if prior_mask is not None:
+            # prior_mask: [B, 196, 1] → [B, 196]
+            prior = prior_mask.squeeze(-1).to(saliency_mask.dtype)
+            saliency_mask = saliency_mask * prior
+        # ────────────────────────────────────────────────────────────────────
+
         guided_patch = x_patch * saliency_mask.unsqueeze(-1).to(x_patch.dtype)
-        guided_feat = guided_patch.mean(dim=1)  
-            
+        guided_feat = guided_patch.mean(dim=1)
+
         return guided_feat * self.gamma.clamp(max=1.0)
 
 
@@ -109,7 +95,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             norm_layer = kwargs['norm_layer']
             embed_dim = kwargs['embed_dim']
             self.fc_norm = norm_layer(embed_dim)
-
             del self.norm  
             
             self.text_attn = TextGuidedSaliencyMask(
@@ -119,12 +104,11 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             )
 
         self.AU_head = nn.Linear(kwargs['embed_dim'], num_classes)
-        
         self.grad_reverse = grad_reverse 
         if not self.grad_reverse == 0:
             self.ID_head = nn.Linear(kwargs['embed_dim'], num_subjects)
 
-    def forward_features(self, x):
+    def forward_features(self, x, prior_mask=None):
         x = self.patch_embed(x)
         x = self._pos_embed(x)
         x = self.norm_pre(x)
@@ -134,12 +118,12 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         if self.global_pool:
             num_prefix = getattr(self, 'num_prefix_tokens', 1)
-            x_patch = x[:, num_prefix:, :]  
-            
+            x_patch = x[:, num_prefix:, :]
+
             global_feat = x_patch.mean(dim=1)
-            text_guided_feat = self.text_attn(x_patch) 
-            
-            # 融合后进行 LayerNorm
+            # ── prior_mask 传入 text_attn ────────────────────────────────────
+            text_guided_feat = self.text_attn(x_patch, prior_mask=prior_mask)
+            # ────────────────────────────────────────────────────────────────
             outcome = self.fc_norm(global_feat + text_guided_feat)
         else:
             x = self.norm(x)
@@ -147,8 +131,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return outcome
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, prior_mask=None):
+        x = self.forward_features(x, prior_mask=prior_mask)
         AU_pred = self.AU_head(x)
 
         if not self.grad_reverse == 0:

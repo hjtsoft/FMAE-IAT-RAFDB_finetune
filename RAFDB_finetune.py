@@ -124,7 +124,7 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
     parser.add_argument('--save_ckpt', action='store_true', help='whether save ckpt at each training epoch.')
     parser.set_defaults(save_ckpt=False)
-
+    parser.add_argument('--prior_mask_dir', default='/Data/hjt/NLA/datasets/RAF-DB/basic/Annotation/au_prior', type=str,help='AU 先验掩码目录（None 时不使用先验）')
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
@@ -383,6 +383,13 @@ def main(args):
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print("\n=== 最终 TTA 评估（加载最优 checkpoint）===")
+    best_ckpt = torch.load(f'{args.output_dir}/checkpoint-best.pth',
+                            map_location='cpu', weights_only=False)
+    model_without_ddp.load_state_dict(best_ckpt['model'], strict=False)
+    model_without_ddp.to(device)
+    tta_stats = evaluate(data_loader_val, model_without_ddp, device, use_tta=True)
+    print(f"TTA 最终精度: {tta_stats['acc1']:.3f}%")
     print('Training time {}'.format(total_time_str))
 
 
